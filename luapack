@@ -1,0 +1,242 @@
+#!/bin/sh
+
+# This file is part of LuaPack.
+#
+# LuaPack is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# LuaPack is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with LuaPack.  If not, see <https://www.gnu.org/licenses/>.
+#
+# For further information about LuaPack you can visit
+# http://cdelord.fr/luapack
+
+set -e
+
+log()
+{
+    local tag=$1
+    shift
+    echo "\e[44m[$tag]\e[0m $*"
+}
+
+err()
+{
+    local tag="ERROR"
+    echo "\e[44m[$tag]\e[0m $*"
+}
+
+##############################################################################
+# Command line arguments
+##############################################################################
+
+CLEAN=false
+OUTPUT=
+WINDOWS=false
+LUA_BUILD=~/.local/var/luapack
+
+usage()
+{
+    cat <<EOF
+Usage: $(basename $0) [-h] [-c] [-w] [-o OUTPUT] [-b BUILD_DIR] script(s)
+
+Options:
+    -h          show this help
+    -c          clean and rebuild the Lua libraries
+    -w          generate a Windows binary with mingw
+    -o OUTPUT   set the name of the output executable
+    -b DIR      set the name of the Lua build directory
+EOF
+    exit 1
+}
+
+PARSED_ARGUMENTS=$(getopt -a -n $(basename $0) -o hcwo:b: -- "$@")
+eval set -- "$PARSED_ARGUMENTS"
+while :
+do
+    case "$1" in
+        -h)     usage;;
+        -c)     CLEAN=true; shift;;
+        -w)     WINDOWS=true; shift;;
+        -o)     OUTPUT="$2"; shift 2;;
+        -b)     LUA_BUILD=$(realpath "$2"); shift 2;;
+        --)     shift; break;;
+        *)      err "Unexpected argument: $1"; usage;;
+    esac
+done
+SCRIPTS="$@"
+
+##############################################################################
+# luapack configuration
+##############################################################################
+
+$CLEAN && rm -rf $LUA_BUILD
+
+##############################################################################
+# Lua sources
+##############################################################################
+
+LUA_VERSION=lua-5.4.3
+LUA_ARCHIVE=$LUA_BUILD/$LUA_VERSION.tar.gz
+LUA_URL=http://www.lua.org/ftp/$(basename $LUA_ARCHIVE)
+
+if ! [ -f $LUA_ARCHIVE ]
+then
+    log "WGET" $LUA_ARCHIVE
+    mkdir -p $(dirname $LUA_ARCHIVE)
+    wget -c $LUA_URL -O $LUA_ARCHIVE
+fi
+
+##############################################################################
+# Native Lua library
+##############################################################################
+
+NATIVE_LIBLUA=$LUA_BUILD/native-$LUA_VERSION/src/liblua.a
+
+LUA_INSTALL=$LUA_BUILD
+LUA=$LUA_INSTALL/bin/lua
+LUAC=$LUA_INSTALL/bin/luac
+
+NATIVE_CC=
+
+for compiler in gcc
+do
+    hash $compiler 2>/dev/null && NATIVE_CC=$compiler
+done
+[ -z $NATIVE_CC ] && err "gcc is not installed" && exit 1
+
+if ! [ -f $NATIVE_LIBLUA ]
+then
+    log "MAKE" "$LUA_VERSION"
+    tar xzf $LUA_ARCHIVE --transform "s/$LUA_VERSION/native-$LUA_VERSION/" -C $LUA_BUILD
+    sed -i "s#^INSTALL_TOP=.*#INSTALL_TOP=$LUA_INSTALL#" $LUA_BUILD/native-$LUA_VERSION/Makefile
+    make -C $LUA_BUILD/native-$LUA_VERSION -j linux
+    make -C $LUA_BUILD/native-$LUA_VERSION install
+fi
+
+##############################################################################
+# MinGW Lua library
+##############################################################################
+
+MINGW_LIBLUA=$LUA_BUILD/mingw-$LUA_VERSION/src/liblua.a
+
+MINGW_CC=
+
+for compiler in x86_64-w64-mingw32-gcc
+do
+    hash $compiler 2>/dev/null && MINGW_CC=$compiler
+done
+$WINDOWS && [ -z $MINGW_CC ] && err "MinGW is not installed" && exit 1
+
+if $WINDOWS && ! [ -f $MINGW_LIBLUA ]
+then
+    log "MAKE" "$LUA_VERSION for Windows"
+    tar xzf $LUA_ARCHIVE --transform "s/$LUA_VERSION/mingw-$LUA_VERSION/" -C $LUA_BUILD
+    sed -i "s/^CC=.*/CC=$MINGW_CC -std=gnu99/" $LUA_BUILD/mingw-$LUA_VERSION/src/Makefile
+    make -C $LUA_BUILD/mingw-$LUA_VERSION -j mingw
+fi
+
+##############################################################################
+# luastatic
+##############################################################################
+
+LUASTATIC_GIT=https://github.com/ers35/luastatic.git
+LUASTATIC=$LUA_BUILD/luastatic
+
+if ! [ -e $LUASTATIC/luastatic.lua ]
+then
+    log "GIT" "$LUASTATIC_GIT"
+    rm -rf $LUASTATIC
+    mkdir -p $LUASTATIC
+    git clone $LUASTATIC_GIT $LUASTATIC
+fi
+
+##############################################################################
+# Output directory
+##############################################################################
+
+if [ -z "$OUTPUT" ]
+then
+    $CLEAN && exit 0
+    usage
+fi
+
+TMP=$(mktemp -d /tmp/luapack.XXXXXX)
+trap "rm -rf $TMP" EXIT
+
+##############################################################################
+# Lua script compilation
+##############################################################################
+
+COMPILED_SCRIPTS=""
+MAIN_SCRIPT=""
+
+for script in $SCRIPTS
+do
+    log "LUAC" $script
+    $LUAC -o $TMP/$(basename ${script%.lua}.luac) $script
+    COMPILED_SCRIPTS="$COMPILED_SCRIPTS $(basename ${script%.lua}.luac)"
+    [ -z "$MAIN_SCRIPT" ] && MAIN_SCRIPT="$(basename ${script%.lua})"
+done
+
+if [ -z "$MAIN_SCRIPT" ]
+then
+    $CLEAN && exit 0
+    usage
+fi
+
+# Single Lua compiled script
+
+SINGLE=$MAIN_SCRIPT.lua
+
+cat <<EOF > $TMP/$SINGLE
+local libs = {
+EOF
+
+for lib in $COMPILED_SCRIPTS
+do
+    cat <<EOF >>$TMP/$SINGLE
+$(basename ${lib%.luac}) = $($LUA -e "print(('%q'):format(io.open('$TMP/$lib'):read('*a')))"),
+EOF
+done
+
+cat <<EOF >> $TMP/$SINGLE
+}
+
+table.insert(package.searchers, 1, function(name)
+    local lib = libs[name]
+    if lib ~= nil then
+        return function()
+            return assert(load(lib, name, "b"))()
+        end
+    end
+end)
+
+require "$MAIN_SCRIPT"
+EOF
+
+##############################################################################
+# Executable
+##############################################################################
+
+log "CC" "$OUTPUT"
+(   cd $TMP
+    if $WINDOWS
+    then
+        export CC=${CC:-$MINGW_CC}
+        LIBLUA=$MINGW_LIBLUA
+    else
+        export CC=${CC:-$NATIVE_CC}
+        LIBLUA=$NATIVE_LIBLUA
+    fi
+    $LUA $LUASTATIC/luastatic.lua $COMPILED_SCRIPTS $LIBLUA -I$(dirname $LIBLUA)
+)
+$WINDOWS && EXE=.exe || EXE=""
+cp $TMP/$MAIN_SCRIPT$EXE $OUTPUT
